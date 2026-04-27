@@ -1,0 +1,157 @@
+1) Crossing-33 (reverse)
+
+We received a PE32 Windows executable and an encrypted flag.txt file. Running strings showed some useful messages:
+
+usage: %s <input-plaintext> <output-flag.txt>
+failed to derive round keys through the gate
+packed %lu bytes into %s
+C33G
+
+At first, the function found from the entry point looked like main, but it was only the CRT startup code. The real challenge logic was the function called with argc and argv, which I renamed to real_main.
+
+The program acts like a packer:
+crossing-33.exe <input-plaintext> <output-flag.txt>
+
+So flag.txt was not the plaintext flag, but the encrypted output produced by the binary.
+
+The file starts with a custom header:
+C33GATE
+The header stores metadata like the version, header size, plaintext size, a few state values, and a FNV-1a hash of the plaintext. The ciphertext starts after the 0x30-byte header.
+
+The interesting part was the message:
+failed to derive round keys through the gate
+
+The binary checks for Wine and Wow64-related functions, then allocates and decrypts a hidden code blob. This is a Heaven’s Gate trick: the 32-bit PE switches into 64-bit code through segment 0x33. That hidden x64 code derives the round keys used by the encryption.
+After extracting/decrypting that blob, the rest of the cipher could be understood from the main function. The encryption works on 16-byte blocks and uses 12 rounds. Since the transformation is reversible, I implemented the inverse operations in Python and decrypted the ciphertext from flag.txt.
+
+After decrypting the blocks and removing the padding/newline, the flag was:
+CTFAC{121ded77fc7fe48754143359bdefee95af4869905335908705b0d1581d651dbc}
+
+script for solution:
+
+#!/usr/bin/env python3
+import struct
+from pathlib import Path
+
+EXE = Path('crossing-33.exe')
+FLAG = Path('flag.txt')
+MASK32 = 0xffffffff
+MASK64 = 0xffffffffffffffff
+
+def u32(x): return x & MASK32
+def lo(x): return x & MASK32
+def hi(x): return (x >> 32) & MASK32
+def rol(x, n):
+    n &= 63
+    return ((x << n) | (x >> (64 - n))) & MASK64
+def ror(x, n):
+    n &= 63
+    return ((x >> n) | (x << (64 - n))) & MASK64
+def add64(a, b): return (a + b) & MASK64
+def bswap32(x): return int.from_bytes(u32(x).to_bytes(4, 'little'), 'big')
+def bswap64(x): return int.from_bytes((x & MASK64).to_bytes(8, 'little'), 'big')
+
+def load_tables(exe_bytes):
+    def words(va, n=24):
+        # .rdata VMA 0x40a000, file offset 0x8600
+        off = 0x8600 + (va - 0x40a000)
+        return list(struct.unpack('<' + 'I' * n, exe_bytes[off:off + 4 * n]))
+    return words(0x40a440), words(0x40a4a0), words(0x40a500), words(0x40a560)
+
+def pair(arr, i): return arr[2*i] | (arr[2*i + 1] << 32)
+
+def keygen(A, B, C, D, K440, K4A0, K500, K560):
+    # Reimplemented from the decrypted x64 Heaven's Gate shellcode.
+    r8 = (A | (B << 32)) & MASK64
+    r9 = (C | (D << 32)) & MASK64
+    r12 = 0x4d7c1e6b8a7935f0 ^ r8
+    r13 = 0x8bd6420f57a6c91d ^ rol(r9, 17)
+    r14 = 0xf1c26a3be490d5c7 ^ add64(r8, r9)
+    r15 = 0x6a09e667f3bcc909 ^ bswap64(r9)
+    out = []
+    for i in range(12):
+        rsi = add64(rol(r15 ^ pair(K560, i), i * 5 + 7), r12)
+        rdi = ror(add64(r14, pair(K500, i)), i * 3 + 11) ^ r13
+        rax = (rsi * 0x9e6c63d0676a9a99) & MASK64
+        rax ^= rol(rdi, 17)
+        rax = add64(rax, pair(K4A0, i))
+        rax ^= rax >> 29
+        rax = (rax * 0xc2b2ae3d27d4eb4f) & MASK64
+        rax ^= rax >> 32
+        out.extend([lo(rax), hi(rax)])
+        r11 = rol(rax, 13) ^ r13
+        rcx = add64(r14, pair(K440, i))
+        rdx = ror(rax, 7) ^ r15
+        rsi = add64(add64(rsi, rdi), i)
+        r12, r13, r14, r15 = r11, rcx, rdx, rsi
+    return out
+
+def round_F(S, i, rk, mask, K440, K4A0, K500, K560):
+    u36, u40 = lo(mask), hi(mask)
+    key = rk[2*i] | (rk[2*i + 1] << 32)
+    u33 = u36 ^ K440[2*i]
+    u40x = u40 ^ K440[2*i + 1]
+
+    t1 = add64(add64(key, pair(K560, i)), u33 | (u40x << 32)) ^ S
+    r1 = rol(t1, (i * 7) % 0x1f + 0xb)
+    r2 = rol(key ^ pair(K500, i), (i * 5) % 0x13 + 7)
+    sm = add64(r1, r2)
+    sl, sh = lo(sm), hi(sm)
+
+    lowbase = u33 ^ K4A0[2*i]
+    lowadd = lowbase + bswap32(sh)
+    carry = 1 if lowadd > MASK32 else 0
+    vallo = u32(lowadd) ^ sl
+    valhi = u32((u40x ^ K4A0[2*i + 1]) + bswap32(sl) + carry) ^ sh
+    val = vallo | (valhi << 32)
+
+    val2 = val ^ rol(key ^ val, 23)
+    x = (val2 * pair(K440, i)) & MASK64
+    x ^= x >> 31
+    y = (x * pair(K4A0, i)) & MASK64
+    y ^= y >> 28
+    return y ^ pair(K500, i)
+
+def decrypt_block(ct, block_index, header, rk, tables):
+    K440, K4A0, K500, K560 = tables
+    A, B, C, D, plain_len = header
+    w = struct.unpack('<4I', ct)
+    idx = block_index + 1
+    mask = (idx * 0x9e3779b97f4a7c15) & MASK64
+    mask ^= (plain_len * 0xd6e8feb86659fd93) & MASK64
+
+    S11 = (w[0] | (w[1] << 32)) ^ rol(C | (D << 32), 9)
+    S12 = (w[2] | (w[3] << 32)) ^ rol(A | (B << 32), 17)
+
+    states = [0] * 13
+    states[11], states[12] = S11, S12
+    for i in range(11, 0, -1):
+        states[i - 1] = states[i + 1] ^ round_F(states[i], i, rk, mask, K440, K4A0, K500, K560)
+
+    S0 = states[0]
+    C0 = states[1] ^ round_F(S0, 0, rk, mask, K440, K4A0, K500, K560)
+    rot = rol(mask, 17)
+    p0 = lo(C0) ^ A ^ lo(mask)
+    p1 = hi(C0) ^ B ^ hi(mask)
+    p2 = lo(S0) ^ C ^ lo(rot)
+    p3 = hi(S0) ^ D ^ hi(rot)
+    return struct.pack('<4I', p0, p1, p2, p3)
+
+def main():
+    exe = EXE.read_bytes()
+    data = FLAG.read_bytes()
+    K440, K4A0, K500, K560 = load_tables(exe)
+    hdr = struct.unpack('<12I', data[:0x30])
+    assert data[:8] == b'C33GATE\x00'
+    plain_len = hdr[4]
+    A, B, C, D = hdr[6], hdr[7], hdr[8], hdr[9]
+    rk = keygen(A, B, C, D, K440, K4A0, K500, K560)
+    pt = b''.join(
+        decrypt_block(data[0x30+i:0x30+i+16], i // 16, (A, B, C, D, plain_len), rk, (K440, K4A0, K500, K560))
+        for i in range(0, len(data) - 0x30, 16)
+    )[:plain_len]
+    print(pt.decode())
+
+if __name__ == '__main__':
+    main()
+        

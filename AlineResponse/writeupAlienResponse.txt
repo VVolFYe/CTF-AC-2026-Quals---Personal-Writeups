@@ -1,0 +1,76 @@
+6) Alien Respone - Second Half (Forensics)
+//This will be a bit of a messier writeup because I took over at the half of the challenge and my colleague sent me a zip with the status of the challenge he was in because he had to go so sorry if it is all over the place:)
+
+The challenge started with a single file called transmission.wav, and the expected flag format was CTFAC{sha256sum}.
+We first inspected the WAV file itself. The file was valid, but after comparing the declared WAV data size with the real file size, we noticed that it had extra data appended after the audio stream. Extracting the appended data gave us payload.zip.
+
+In parallel, we analyzed the audio signal. It decoded as SSTV, Martin 1. The image showed two aliens holding a sign written in an alien alphabet. Decoding the text from that image gave us the first password:
+5H0WM3WH47Y0UG07
+
+Using this password, payload.zip could be decrypted. Inside it, we found:
+flag.txt
+final.zip
+relic.png
+
+The file flag.txt contained:
+CTF{T00_EAS_TRY_H4RD3R}  
+//54L1V4 ce sa faci :)
+
+This was clearly a fake flag, so the real challenge continued.
+
+final.zip contained message.raw, but it was still encrypted. The previous password did not work, so the remaining useful artifact was relic.png.
+Before the handoff, we tried to solve relic.png visually. The image had a monitor with more alien symbols, so we cropped it, corrected the perspective, binarized it, and compared the glyphs with the ones from the SSTV image. This looked relevant, but it did not give us a valid final password. We also tried many targeted password candidates based on the visible text, the alien theme, Rick and Morty references, "Show me what you got", leetspeak versions, prefixes, and suffixes. In total, around 75k candidates were tested, but none of them worked.
+The better lead was the PNG file structure itself. relic.png did not end cleanly after the IEND chunk. After IEND, there was appended data:
+
+||THRONE||
+
+e045be6a99bcfd8de75b5684943e1b38
+
+gAAAAABp6pp-7Fa7j7egmnCGzsSXS-2QW6qWKWEKGg3BuCvNFeAbKO5UOY_fzc_NvrckmBDjmd-bzyzvHkeVaNIqf4mGvuk7DsG36ryH1yOV9uEBJ45_6-A=
+
+||THRONE||
+
+This looked intentional, because the gAAAAA... value had the structure of a Fernet token, while the 16-byte hex string looked like a salt or key material.
+
+I initiated the second part of the investigation from this handoff state. The important starting point was that payload.zip was already solved using 5H0WM3WH47Y0UG07, while final.zip was still encrypted. I checked the extracted files again and confirmed that flag.txt was only a decoy, and that the real path most likely involved relic.png and the encrypted final.zip.
+I then focused on relic.png, since it contained the clearest remaining artifact. I inspected the PNG trailer after the IEND chunk and confirmed that the appended data was not random noise. It contained the THRONE marker, the hex string e045be6a99bcfd8de75b5684943e1b38, and a Fernet-like token.
+I also found a tEXt chunk inside the PNG metadata. After base64 decoding it, the result was:
+
+Created using ThroneLSP v1.1.0
+This confirmed that the THRONE marker was intentional and directly related to the image. After that, I ran zsteg on relic.png.
+
+The relevant payload was found in the b1,b,lsb,xy channel. Extracting it gave:
+XRL=j3_a33q_g0_t0_q33c3e
+
+I noticed that XRL is KEY encoded with ROT13. Applying ROT13 to the entire string gave:
+KEY=w3_n33d_t0_g0_d33p3r
+
+This password did not directly decrypt final.zip, so I used it together with the THRONE block.
+
+I treated the THRONE block as a combination of a cryptographic salt and a Fernet token. The hex string:
+e045be6a99bcfd8de75b5684943e1b38
+
+was used as the salt. Then I used the password:
+w3_n33d_t0_g0_d33p3r
+
+with PBKDF2 HMAC SHA256 and 480000 iterations to derive the Fernet key. With that key, the Fernet token decrypted successfully and revealed:
+pr1m3_1834N_6675W
+
+This turned out to be the correct password for final.zip. Using it, I extracted message.raw.
+
+After that, I analyzed message.raw in several ways. I first treated it as possible raw audio and generated spectrograms, but the output was only uniform noise. I also tried different encoding schemes such as base85, base88, base91, and other basic transformations, but none of them produced anything coherent.
+
+The final clue came from the password itself:
+pr1m3_1834N_6675W
+
+I interpreted the pr1m3 part not only as part of the password, but also as an instruction. Based on that, I extracted the characters from message.raw that were located at prime index positions.
+
+This extracted subset was very different from the rest of the file. The beginning of the prime-indexed data was a clean block made only of dots and hash symbols. The clean prefix had exactly 1679 characters.
+1679 = 23 * 73
+
+This matched the classic dimensions of the Arecibo message, which also fit the alien theme of the challenge. Immediately after those 1679 characters, the data became noise again, confirming that this clean prefix was the intended payload.
+I rendered the 1679 characters as a 23x73 bitmap. In the correct orientation, the resulting image showed the flag in a small 3x5 pixel font.
+
+Final flag:
+CTFAC{41357A6F1dAb8E0bdC3898Ed3d2E5867591Eb2C5A67820A7d44E3dF36FF1bb99}
+(it might be a couple of characters off because i literally tried it and got it from the 5th try and I have all of them saved so sorry)

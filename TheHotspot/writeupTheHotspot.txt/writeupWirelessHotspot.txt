@@ -1,0 +1,21 @@
+11) Wireless Hotspot (web)
+
+The first useful thing was that authentication was weak. Access to the panel could be bypassed just by setting the cookie logindat=1, which gave access to pages like wireless.html, internet.html, usage.html, messages.html, and setting.html.
+
+After getting into the panel, I checked the available pages and CGI endpoints. The HTML showed several forms using endpoints like /cgi-bin/getconfig.cgi and /cgi-bin/setconfig.cgi, and the message page revealed another endpoint: /cgi-bin/smspost.cgi. That one looked interesting because it was the only feature that directly processed user-controlled input and returned a visible response.
+
+By testing smspost.cgi, I noticed the response always echoed the message and then printed a wc: line. That suggested the backend was probably building a shell command with the message inside quotes. Simple payloads like ; id or $(id) did not work by themselves, but adding a quote to break out of the existing string did.
+
+The payload style that worked was:
+'; command #
+
+Those confirmed command injection and showed that commands were running as www-data, with the CGI scripts located in /usr/local/apache2/cgi-bin.
+
+From there, I used short enumeration commands through the same injection to inspect the filesystem. Listing /tmp revealed a file named flag.txt, which was the main clue:
+'; ls -la /tmp #
+
+That output showed /tmp/flag.txt, so the final step was just to read it with:
+'; cat /tmp/flag.txt #
+
+That returned the flag:
+CTFAC{2bfa2948523d321a8e7eb7f11f62b82fcc7b3797b8b4823a6323f03c75120a3b}

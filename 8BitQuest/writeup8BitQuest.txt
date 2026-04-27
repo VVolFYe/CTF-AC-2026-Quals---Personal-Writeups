@@ -1,0 +1,93 @@
+2) 8 Bit Quest (web)
+
+This challenge looked like a retro web maze, but the real logic was hidden in the room numbers, the torch patterns, and the changing door graph.
+
+The first useful observation was that room URLs were deterministic. The starting room linked to:
+
+73d3f1ba062585bce51f77d70a26be88c44b55d70f81b8bd7e2ded030ca4454a
+
+and that is exactly:
+
+sha256("167")
+
+So normal room URLs are just SHA-256 hashes of the room number.
+
+
+1. Understanding the torches
+
+Each room had 8 torches, lit or unlit. At first this looked like plain binary encoding, but the important detail was what the binary value represented.
+
+Example:
+
+- Room 167 had torches: 00100111 = 39
+- Room 397 had torches: 01001110 = 78
+
+167 is the 39th prime number, and 397 is the 78th prime number.
+
+So the torch pattern is not the room number itself. It is:
+
+the index of that room inside the ordered list of prime numbers
+
+This is the core mechanic of the whole challenge.
+
+
+2. What the rooms were saying
+
+Some rooms had a visible letter in the central tower, others were blank. Once enough rooms were collected, sorting them by the torch value / prime index gave a message.
+
+After reconstructing enough of the set, the hidden text became:
+
+"I AM WRITING THIS SPECIFIC SENTENCE TO INFORM YOU THAT THE CRYPTOGRAPHIC SALT YOU NEED TO USE FOR YOUR CURRENT APPLICATIONS IS EXACTLY PRINCESSBITS, AND I AM PADDING THE REST OF THIS TEXT WITH EXTRA WORDS TO ENSURE IT HITS EXACTLY TWO HUNDRED FIFTY FOUR."
+
+There were some missing letters during partial reconstruction because the room graph was dynamic, so different visits exposed different rooms. That is why incomplete crawls produced broken versions such as "PRINCESSBTS" instead of "PRINCESSBITS".
+
+
+3. Important detail: the graph was dynamic
+
+One trap in the challenge was that the same room could expose different outgoing doors at different times. That means the palace was not a static graph.
+
+Because of that:
+
+- one crawl was not enough
+- local reasoning was needed after each batch
+- partial data could still be useful if sorted by prime index
+
+The right approach was not to brute force everything aggressively, but to gather enough rooms to reconstruct the hidden message.
+
+
+4. Extracting the actual hint
+
+The message gives two important pieces of information:
+
+- the cryptographic salt is PRINCESSBITS
+- the sentence length is exactly 254
+
+The final sentence about "two hundred fifty four" is not filler. It points to the index boundary we need.
+
+Since the message reaches prime index 254, the hidden chamber is the next logical step:
+
+255th prime = 1613
+
+So the hidden chamber should be based on room number 1613, but not with the normal rule sha256("1613"). Instead, the challenge says we need to use the salt for the "current application".
+
+
+5. Finding the hidden room
+
+The correct construction turned out to be:
+
+sha256("1613PRINCESSBITS")
+
+This gives:
+
+b98fde03ff8f75a04d1b95515d0b1c37332eb9299720c8be92361e598bdfa5f1
+
+Opening:
+
+/b98fde03ff8f75a04d1b95515d0b1c37332eb9299720c8be92361e598bdfa5f1
+
+returned the victory page, titled "Injected Palace Room", with the flag.
+
+
+6. Final flag
+
+CTFAC{448e7dc1c138275699d8b842831eab943c527eb8dd320bdb8733cbfa94fedbda}

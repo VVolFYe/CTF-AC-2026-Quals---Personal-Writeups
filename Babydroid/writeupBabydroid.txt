@@ -1,0 +1,58 @@
+9) Babydroid (rev APK)
+
+I started by looking through the APK statically instead of trying to brute force anything from the app.
+The app looked pretty simple. It had a Base URL field, an input for some text, an Encrypt button, then it showed a Key state and a Ciphertext.
+At first I expected a local flag check or some hardcoded hash, but the app was not doing that. It was getting data from the server, transforming it, then using it as an AES key.
+In the APK, the important part was in GhostBoxKt and some obfuscated classes like mw, qa, qh0, di and dl0.
+
+The hidden endpoint was not written directly. It was built from base64 strings that were XORed with the key baby_secret_key.
+
+After decoding those strings, the hidden route was:
+/v1/hidden/flag
+The other important route was built in the encryption logic:
+/takei/ppv1?n=7&shift=3
+This endpoint was used to build the AES key.
+
+The tricky part was how the app handled the response. It made a GET request, read the response line by line with readLine, and added every line into one big string. That means the newlines were removed.
+After that, the app applied a Caesar shift of plus 3 on letters, then reversed the whole string.
+That final string was used as the key source.
+
+The AES key was:
+SHA256(key source), first 16 bytes
+So basically AES 128 with AES GCM NoPadding. The encrypted blob format was:
+first 12 bytes nonce
+rest ciphertext plus tag
+
+The remote gave a 404 response for:
+/takei/ppv1?n=7&shift=3
+but that 404 body was still used by the app to derive the key.
+The hidden endpoint:
+/v1/hidden/flag
+returned a long base64 blob.
+
+I initially got stuck because I copied the 404 body from curl with newlines included. The app does not keep those newlines, because it uses readLine and concatenates the lines. That changed the SHA256 completely, so AES GCM kept failing.
+After fixing that, the decrypt worked.
+
+I also used the emulattor to confirm the behaviour. I installed the APK, ran a local server through 10.0.2.2:8000, and saw that the app really requested:
+/v1/hidden/flag
+/takei/ppv1?n=7&shift=3
+
+Using uiautomator dump, I also checked the Key state shown in the UI and it matched the transformed 404 body, so the logic was corect.
+
+In the end the solve was:
+get the 404 body from /takei/ppv1?n=7&shift=3
+remove newlines like the app does
+apply Caesar plus 3 on letters
+revrese the result
+
+take SHA256 of it and keep the first 16 bytes
+
+download the base64 blob from /v1/hidden/flag
+base64 decode it
+
+use the first 12 bytes as nonce
+decrypt the rest with AES GCM
+
+The flag was:
+CTFAC{1d7a45f59c3ba3d823da185d5daf03c6706b631cfb74efcf21c0dd23cc3fb915}
+This was not really about breaking AES. The crypto was normal, but the main part was understanding exactly how the android app built the key and noticing that the 404 body still mattered lol.

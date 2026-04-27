@@ -1,0 +1,25 @@
+
+12) Phantomledger (Threat Hunting)
+
+I first focused on WS-FIN-011 because it looked like the obvious suspicious host. It had 7z, PowerShell, Outlook process chains and access to exports/tmp.bin, so it looked promising. The problem was that this path was full of noise and fake clues, including misleading note fields that looked like direct instructions. 
+After checking it more closely, that path did not lead to the real flag. (I was kind of confident at this point but then got knocked back lol)
+
+What actually led to the flag was shifting focus to DNS TXT records that looked much more structured. 
+There, on WS-FIN-044, I found activity related to cachecdn-sync.net, and the important events had the note operator recovery channel plus very clear event IDs: DNS-FLAG-CHUNK-0 through DNS-FLAG-CHUNK-3.
+
+It was a long journey to get tries to export stuff to put it back together into something that made sense, but this is what got me what I needed (put back into one, almost)
+
+index=phantomledger sourcetype=phantomledger:dns
+| spath
+| search record_type="TXT" note="operator recovery channel" query="*cachecdn-sync.net*"
+| rex field=event_id "DNS-FLAG-CHUNK-(?<chunk>\d+)"
+| where isnotnull(chunk)
+| eval chunk_num=tonumber(chunk)
+| sort 0 chunk_num
+| table chunk_num _time src_host query answer event_id
+
+This returned 4 chunks, each containing a base64 string in the answer field. I took them in order, base64-decoded them, and concatenated the results. That reconstructed all
+
+Final flag:
+CTFAC{16bcd84c9253c2c1d031ac71b8e2167e9043be62f02c4d5911d694d12efbd6ac}
+//Shorter writeup but it's 6:30 AM

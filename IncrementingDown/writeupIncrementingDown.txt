@@ -1,0 +1,9 @@
+10) Incrementing Down (web)
+
+I first checked whether the challenge had hidden endpoints or useful query parameters, but none of that changed the behavior in a meaningful way. The page always returned the same app, and the interesting part was clearly the ASCII counter.
+After that, I started treating it as a stateful timing challenge instead of a normal web enum challenge. The important observation was that different request patterns affected the counter differently. Heavy flooding mostly froze it, while a steady stream of requests made it drift downward.
+To work with it properly, I wrote a small parser for the ASCII digits so I could monitor the displayed value instead of guessing from the box-drawing characters. Once I could read the counter reliably, I noticed that regular GET requests at about one per second were enough to keep pushing it down.
+From there, the solution was just to keep the request rhythm stable and watch the value decrease. When it reached zero and went below it, the counter renderer broke and the application replaced the ASCII display with the flag.
+
+Flag:
+CTFAC{1d844122621eba48f18d4755e677e024159b66c4a5260dcc0868d14f704bae65}

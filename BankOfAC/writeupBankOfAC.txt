@@ -1,0 +1,14 @@
+4) Bank of AC (misc)
+
+I started by looking at the GitHub repository behind the dead site and checking its commit history. The visible commits were very small, only adding files like README.md and robots.txt, so there was no flag directly in the current repository state.
+
+The robots.txt file pointed to /records/, which suggested there might have been hidden content before the site disappeared. From there, I checked the Wayback Machine and found an archived snapshot of the website, including the old JavaScript bundle and CSS files.
+
+After downloading the archived JavaScript bundle, I searched through it for useful keywords such as vault, secret, flag, CTF, and route names. This showed that the app was a small React site with two routes: / and /secret. The main page had an “Unlock Vault” button that redirected to /secret after a short delay.
+
+Then I inspected the component used for the /secret route. Inside that component, there was a secret-data-box element containing a hardcoded code block with the full flag string. The important part was to extract the entire value correctly, because an earlier partial copy missed some characters in the middle.
+
+Final flag:
+CTF{dc04c2197802d1375a3ddd78b66c0cf6b194ef645ecb657e505e555c9e121075}
+I thought it was gonna be CTFAC{} the format and I ignored it at first but that's fine
+It also didn't help that i used grep and looked specifically for CTFAC not CTF but at least it worked out in the end
